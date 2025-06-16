@@ -49,6 +49,11 @@ pub enum HeaderMode {
     /// Only metadata that is directly relevant to the identity of a file will
     /// be included. In particular, ownership and mod/access times are excluded.
     Deterministic,
+
+    #[cfg(unix)]
+    /// Complete, but with mtime's greater than this value clamped to it.
+    /// Unix only
+    ClampMtime(u64),
 }
 
 /// Representation of the header of an entry in an archive
@@ -795,6 +800,16 @@ impl Header {
                     0o644
                 };
                 self.set_mode(fs_mode);
+            }
+            HeaderMode::ClampMtime(clamp) => {
+                self.set_mtime(if meta.mtime() as u64 > clamp {
+                    clamp
+                } else {
+                    meta.mtime() as u64
+                });
+                self.set_uid(0);
+                self.set_gid(0);
+                self.set_mode(0o644);
             }
         }
 
