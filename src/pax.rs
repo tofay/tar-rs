@@ -158,38 +158,6 @@ impl<T: Write> crate::Builder<T> {
         &mut self,
         headers: impl IntoIterator<Item = (&'key str, &'value [u8])>,
     ) -> Result<(), io::Error> {
-        // Store the headers formatted before write
-        let mut data: Vec<u8> = Vec::new();
-
-        // For each key in headers, convert into a sized space and add it to data.
-        // This will then be written in the file
-        for (key, value) in headers {
-            let mut len_len = 1;
-            let mut max_len = 10;
-            let rest_len = 3 + key.len() + value.len();
-            while rest_len + len_len >= max_len {
-                len_len += 1;
-                max_len *= 10;
-            }
-            let len = rest_len + len_len;
-            write!(&mut data, "{} {}=", len, key)?;
-            data.extend_from_slice(value);
-            data.push(b'\n');
-        }
-
-        // Ignore the header append if it's empty.
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        // Create a header of type XHeader, set the size to the length of the
-        // data, set the entry type to XHeader, and set the checksum
-        // then append the header and the data to the archive.
-        let mut header = crate::Header::new_ustar();
-        let data_as_bytes: &[u8] = &data;
-        header.set_size(data_as_bytes.len() as u64);
-        header.set_entry_type(crate::EntryType::XHeader);
-        header.set_cksum();
-        self.append(&header, data_as_bytes)
+        crate::builder::append_pax_extensions(self.get_mut(), headers)
     }
 }

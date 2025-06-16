@@ -25,6 +25,8 @@ struct BuilderOptions {
     mode: HeaderMode,
     follow: bool,
     sparse: bool,
+    #[cfg(feature = "xattr")]
+    preserve_xattr: bool,
 }
 
 impl<W: Write> Builder<W> {
@@ -37,6 +39,8 @@ impl<W: Write> Builder<W> {
                 mode: HeaderMode::Complete,
                 follow: true,
                 sparse: true,
+                #[cfg(feature = "xattr")]
+                preserve_xattr: false,
             },
             finished: false,
             obj: Some(obj),
@@ -64,6 +68,12 @@ impl<W: Write> Builder<W> {
     /// empty segments are omitted from the archive. Defaults to true.
     pub fn sparse(&mut self, sparse: bool) {
         self.options.sparse = sparse;
+    }
+
+    #[cfg(feature = "xattr")]
+    /// Preserve extended attributes when writing the archive.
+    pub fn preserve_xattr(&mut self, preserve: bool) {
+        self.options.preserve_xattr = preserve;
     }
 
     /// Gets shared reference to the underlying object.
@@ -701,6 +711,14 @@ fn append_file(
         None
     };
     header.set_cksum();
+
+    #[cfg(all(unix, feature = "xattr"))]
+    {
+        if options.preserve_xattr {
+            add_xattrs_header(dst, path)?;
+        }
+    }
+
     dst.write_all(header.as_bytes())?;
 
     if let Some(sparse_entries) = sparse_entries {
@@ -726,6 +744,63 @@ fn append_dir(
 ) -> io::Result<()> {
     let stat = fs::metadata(src_path)?;
     append_fs(dst, path, &stat, options.mode, None)
+}
+
+#[cfg(feature = "xattr")]
+pub(crate) fn append_pax_extensions<'key, 'value>(
+    dst: &mut dyn Write,
+    headers: impl IntoIterator<Item = (&'key str, &'value [u8])>,
+) -> Result<(), io::Error> {
+    // Store the headers formatted before write
+    let mut data: Vec<u8> = Vec::new();
+
+    // For each key in headers, convert into a sized space and add it to data.
+    // This will then be written in the file
+    for (key, value) in headers {
+        let mut len_len = 1;
+        let mut max_len = 10;
+        let rest_len = 3 + key.len() + value.len();
+        while rest_len + len_len >= max_len {
+            len_len += 1;
+            max_len *= 10;
+        }
+        let len = rest_len + len_len;
+        write!(&mut data, "{} {}=", len, key)?;
+        data.extend_from_slice(value);
+        data.push(b'\n');
+    }
+
+    // Ignore the header append if it's empty.
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    // Create a header of type XHeader, set the size to the length of the
+    // data, set the entry type to XHeader, and set the checksum
+    // then append the header and the data to the archive.
+    let mut header = crate::Header::new_ustar();
+    let data_as_bytes: &[u8] = &data;
+    header.set_size(data_as_bytes.len() as u64);
+    header.set_entry_type(crate::EntryType::XHeader);
+    header.set_cksum();
+    dst.write_all(header.as_bytes())?;
+    dst.write_all(data_as_bytes)?;
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "xattr"))]
+// Convert any extended attributes on the specified path to a tar PAX extension header, and add it to the tar archive
+fn add_xattrs_header(dst: &mut dyn Write, path: impl AsRef<Path>) -> io::Result<()> {
+    use crate::pax::PAX_SCHILYXATTR;
+
+    let headers = xattr::list(path.as_ref())?
+        .map(|key| {
+            let value = xattr::get(path.as_ref(), &key)?.unwrap_or_default();
+            let key = format!("{PAX_SCHILYXATTR}{key}", key = key.to_string_lossy());
+            Result::<_, io::Error>::Ok((key, value))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    append_pax_extensions(dst, headers.iter().map(|(k, v)| (k.as_str(), v.as_slice())))
 }
 
 fn prepare_header(size: u64, entry_type: u8) -> Header {
