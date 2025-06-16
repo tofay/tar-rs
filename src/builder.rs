@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::io::prelude::*;
 use std::path::Path;
+use std::path::PathBuf;
 use std::str;
 
 use crate::header::BLOCK_SIZE;
@@ -18,6 +20,7 @@ pub struct Builder<W: Write> {
     options: BuilderOptions,
     finished: bool,
     obj: Option<W>,
+    hardlinks: HashMap<(u64, u64), PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -25,6 +28,7 @@ struct BuilderOptions {
     mode: HeaderMode,
     follow: bool,
     sparse: bool,
+    follow_hardlinks: bool,
 }
 
 impl<W: Write> Builder<W> {
@@ -37,9 +41,11 @@ impl<W: Write> Builder<W> {
                 mode: HeaderMode::Complete,
                 follow: true,
                 sparse: true,
+                follow_hardlinks: true,
             },
             finished: false,
             obj: Some(obj),
+            hardlinks: HashMap::new(),
         }
     }
 
@@ -57,6 +63,15 @@ impl<W: Write> Builder<W> {
     /// `--dereference` or `-h` options <https://man7.org/linux/man-pages/man1/tar.1.html>.
     pub fn follow_symlinks(&mut self, follow: bool) {
         self.options.follow = follow;
+    }
+
+    /// Follow hardlinks, archiving the contents of the file they point to rather
+    /// than adding a link to the archive. Defaults to true.
+    ///
+    /// When true, it exhibits the same behavior as GNU `tar` command's
+    /// `--hard-dereference` option <https://man7.org/linux/man-pages/man1/tar.1.html>.
+    pub fn follow_hardlinks(&mut self, follow: bool) {
+        self.options.follow_hardlinks = follow;
     }
 
     /// Handle sparse files efficiently, if supported by the underlying
@@ -263,14 +278,7 @@ impl<W: Write> Builder<W> {
         path: P,
         target: T,
     ) -> io::Result<()> {
-        self._append_link(header, path.as_ref(), target.as_ref())
-    }
-
-    fn _append_link(&mut self, header: &mut Header, path: &Path, target: &Path) -> io::Result<()> {
-        prepare_header_path(self.get_mut(), header, path)?;
-        prepare_header_link(self.get_mut(), header, target)?;
-        header.set_cksum();
-        self.append(header, std::io::empty())
+        _append_link(self.get_mut(), header, path.as_ref(), target.as_ref())
     }
 
     /// Adds a file on the local filesystem to this archive.
@@ -298,8 +306,19 @@ impl<W: Write> Builder<W> {
     /// ar.append_path("foo/bar.txt").unwrap();
     /// ```
     pub fn append_path<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
-        let options = self.options;
-        append_path_with_name(self.get_mut(), path.as_ref(), None, options)
+        let Self {
+            hardlinks,
+            obj,
+            options,
+            ..
+        } = self;
+        append_path_with_name(
+            &mut obj.as_mut().unwrap(),
+            path.as_ref(),
+            None,
+            *options,
+            hardlinks,
+        )
     }
 
     /// Adds a file on the local filesystem to this archive under another name.
@@ -335,8 +354,19 @@ impl<W: Write> Builder<W> {
         path: P,
         name: N,
     ) -> io::Result<()> {
-        let options = self.options;
-        append_path_with_name(self.get_mut(), path.as_ref(), Some(name.as_ref()), options)
+        let Self {
+            hardlinks,
+            obj,
+            options,
+            ..
+        } = self;
+        append_path_with_name(
+            &mut obj.as_mut().unwrap(),
+            path.as_ref(),
+            Some(name.as_ref()),
+            *options,
+            hardlinks,
+        )
     }
 
     /// Adds a file to this archive with the given path as the name of the file
@@ -366,8 +396,19 @@ impl<W: Write> Builder<W> {
     /// ar.append_file("bar/baz.txt", &mut f).unwrap();
     /// ```
     pub fn append_file<P: AsRef<Path>>(&mut self, path: P, file: &mut fs::File) -> io::Result<()> {
-        let options = self.options;
-        append_file(self.get_mut(), path.as_ref(), file, options)
+        let Self {
+            hardlinks,
+            obj,
+            options,
+            ..
+        } = self;
+        append_file(
+            &mut obj.as_mut().unwrap(),
+            path.as_ref(),
+            file,
+            *options,
+            hardlinks,
+        )
     }
 
     /// Adds a directory to this archive with the given path as the name of the
@@ -465,8 +506,20 @@ impl<W: Write> Builder<W> {
         P: AsRef<Path>,
         Q: AsRef<Path>,
     {
-        let options = self.options;
-        append_dir_all(self.get_mut(), path.as_ref(), src_path.as_ref(), options)
+        let Self {
+            hardlinks,
+            obj,
+            options,
+            ..
+        } = self;
+        append_dir_all(
+            &mut obj.as_mut().unwrap(),
+            path.as_ref(),
+            src_path.as_ref(),
+            *options,
+            hardlinks,
+        )?;
+        Ok(())
     }
 
     /// Finish writing this archive, emitting the termination sections.
@@ -599,11 +652,24 @@ fn pad_zeroes(dst: &mut dyn Write, len: u64) -> io::Result<()> {
     Ok(())
 }
 
+fn _append_link(
+    dst: &mut dyn Write,
+    header: &mut Header,
+    path: &Path,
+    target: &Path,
+) -> io::Result<()> {
+    prepare_header_path(dst, header, path)?;
+    prepare_header_link(dst, header, target)?;
+    header.set_cksum();
+    append(dst, header, &mut std::io::empty())
+}
+
 fn append_path_with_name(
     dst: &mut dyn Write,
     path: &Path,
     name: Option<&Path>,
     options: BuilderOptions,
+    hardlinks: &mut HashMap<(u64, u64), PathBuf>,
 ) -> io::Result<()> {
     let stat = if options.follow {
         fs::metadata(path).map_err(|err| {
@@ -622,7 +688,7 @@ fn append_path_with_name(
     };
     let ar_name = name.unwrap_or(path);
     if stat.is_file() {
-        append_file(dst, ar_name, &mut fs::File::open(path)?, options)
+        append_file(dst, ar_name, &mut fs::File::open(path)?, options, hardlinks)
     } else if stat.is_dir() {
         append_fs(dst, ar_name, &stat, options.mode, None)
     } else if stat.file_type().is_symlink() {
@@ -689,8 +755,35 @@ fn append_file(
     path: &Path,
     file: &mut fs::File,
     options: BuilderOptions,
+    hardlinks: &mut HashMap<(u64, u64), PathBuf>,
 ) -> io::Result<()> {
     let stat = file.metadata()?;
+
+    #[cfg(unix)]
+    {
+        use std::{collections::hash_map::Entry, os::unix::fs::MetadataExt as _};
+
+        if stat.nlink() > 1 && !options.follow_hardlinks {
+            match hardlinks.entry((stat.dev(), stat.ino())) {
+                Entry::Occupied(e) => {
+                    // We've seen this inode before, so we can just create a link
+                    // to the previous path.
+                    let mut header = Header::new_gnu();
+                    header.set_metadata_in_mode(&stat, options.mode);
+                    header.set_size(0);
+                    header.set_entry_type(EntryType::Link);
+                    header.set_cksum();
+                    _append_link(dst, &mut header, path, e.get())?;
+                    return Ok(());
+                }
+                Entry::Vacant(e) => {
+                    // This is the first time we've seen this inode
+                    e.insert(path.to_owned());
+                }
+            }
+        }
+    }
+
     let mut header = Header::new_gnu();
 
     prepare_header_path(dst, &mut header, path)?;
@@ -873,6 +966,7 @@ fn append_dir_all(
     path: &Path,
     src_path: &Path,
     options: BuilderOptions,
+    hardlinks: &mut HashMap<(u64, u64), PathBuf>,
 ) -> io::Result<()> {
     let mut stack = vec![(src_path.to_path_buf(), true, false)];
     while let Some((src, is_dir, is_symlink)) = stack.pop() {
@@ -900,7 +994,7 @@ fn append_dir_all(
                     continue;
                 }
             }
-            append_file(dst, &dest, &mut fs::File::open(src)?, options)?;
+            append_file(dst, &dest, &mut fs::File::open(src)?, options, hardlinks)?;
         }
     }
     Ok(())
